@@ -1,3 +1,26 @@
+"""
+動画要約ツール (Video Summarizer)
+
+概要:
+    ローカルPC上の動画ファイルから音声を抽出し、文字起こし・要約するGUIアプリ。
+
+用途:
+    ・講義や会議の録画をテキスト化して内容把握
+    ・動画の内容を簡潔にまとめて共有
+    ・長い動画から重要なポイントだけ抽出
+
+前提条件:
+    - Python 3.8+
+    - ffmpeg (PATH必須: winget install ffmpeg)
+    - pip install faster-whisper janome
+    - NVIDIA GPU (任意: なくてもCPU動作可)
+
+出力:
+    動画と同じフォルダに [ファイル名]_summary.txt
+    ・文字起こし全文（タイムスタンプ付き）
+    ・TextRankによる抽出型要約
+"""
+
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox
 import threading
@@ -10,6 +33,8 @@ WHISPER_MODEL_SIZE = "large-v3"
 
 
 def _find_ffmpeg():
+    # ffmpegがコマンドとして使えるか確認する
+    # CREATE_NO_WINDOW で余計な黒い窓を表示しない
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
         return "ffmpeg"
@@ -21,6 +46,7 @@ FFMPEG_PATH = _find_ffmpeg()
 
 
 class VideoSummarizerApp:
+    # ffmpeg(音声抽出) → faster-whisper(文字起こし) → TextRank(要約) を逐次実行するメインクラス
     def __init__(self, root):
         self.root = root
         self.root.title("動画要約ツール")
@@ -74,6 +100,8 @@ class VideoSummarizerApp:
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
     def log(self, msg):
+        # ログエリアにタイムスタンプ付きでメッセージを追記する
+        # update_idletasks で即座にGUI描画を反映
         ts = time.strftime("%H:%M:%S")
         self.log_text.configure(state="normal")
         self.log_text.insert(tk.END, f"[{ts}] {msg}\n")
@@ -98,6 +126,8 @@ class VideoSummarizerApp:
         self.run_btn.configure(state=state)
 
     def start_pipeline(self):
+        # バリデーション後、別スレッドでパイプラインを開始
+        # メインスレッドをブロックせずGUIを応答可能に保つ
         if not self.video_path.get():
             messagebox.showwarning("警告", "動画ファイルを選択してください。")
             return
@@ -113,6 +143,8 @@ class VideoSummarizerApp:
         threading.Thread(target=self._run_pipeline, daemon=True).start()
 
     def _run_pipeline(self):
+        # 3ステップ(音声抽出→文字起こし→要約)のパイプライン本体
+        # 一時WAVファイルは finally で確実に削除
         video = self.video_path.get()
         base = os.path.splitext(video)[0]
         wav_path = base + "_audio_temp.wav"
@@ -171,6 +203,8 @@ class VideoSummarizerApp:
             self.set_ui_enabled(True)
 
     def _extract_audio(self, video_path, wav_path):
+        # ffmpegで動画から音声を抽出
+        # 16kHz モノラル WAV はWhisper推奨の入力フォーマット
         cmd = [
             FFMPEG_PATH, "-y", "-i", video_path,
             "-vn", "-acodec", "pcm_s16le",
@@ -185,6 +219,9 @@ class VideoSummarizerApp:
             raise RuntimeError(f"ffmpeg error: {proc.stderr.strip()}")
 
     def _transcribe(self, audio_path):
+        # faster-whisper で音声認識
+        # CUDA有無を自動判定しGPU/CPUを切り替え
+        # large-v3モデル（日本語に最適）は初回起動時に自動ダウンロード(~3GB)
         try:
             import ctranslate2
             has_cuda = ctranslate2.get_cuda_device_count() > 0
@@ -206,10 +243,14 @@ class VideoSummarizerApp:
         return list(segments)
 
     def _summarize_with_transformers(self, text):
+        # 文字起こし全文から重要文を抽出して要約する
+        # 教師なしの TextRank を使用（LLM不要、軽量）
         self.log("   TextRank 抽出型要約を実行中...")
         return self._textrank_summarize(text)
 
     def _textrank_summarize(self, text, ratio=0.3, min_sents=5):
+        # TextRank: 文をノード、単語の重なりをエッジ重みとするグラフにPageRankを適用
+        # janomeで形態素解析し、名詞/動詞/形容詞を特徴語として抽出
         from janome.tokenizer import Tokenizer
         import math
 
@@ -230,6 +271,8 @@ class VideoSummarizerApp:
         sent_words = [get_words(s) for s in sents]
         n = len(sents)
 
+        # 文間類似度行列を計算（PageRankの遷移確率として利用）
+        # 類似度 = 共通単語数 ÷ (各文の長さの対数和) — 文長の正規化のため対数を使用
         similarity = [[0.0] * n for _ in range(n)]
         for i in range(n):
             for j in range(i + 1, n):
@@ -240,6 +283,7 @@ class VideoSummarizerApp:
                     sim = len(sw) / (math.log(len(sent_words[i]) + 1) + math.log(len(sent_words[j]) + 1) + 1e-8)
                 similarity[i][j] = similarity[j][i] = sim
 
+        # PageRank 反復: d=0.85 は damping factor（標準値）
         scores = [1.0 / n] * n
         d = 0.85
         for _ in range(50):
@@ -269,6 +313,7 @@ class VideoSummarizerApp:
 
     @staticmethod
     def _split_sentences(text):
+        # 日本語の句点（。！？）と改行で文単位に分割
         import re
         raw = re.split(r"(?<=[。！？\n])", text)
         result = []
@@ -280,6 +325,7 @@ class VideoSummarizerApp:
 
     @staticmethod
     def _fmt_sec(seconds):
+        # 秒数(浮動小数点)を "MM:SS" または "HH:MM:SS" 形式に変換
         h = int(seconds // 3600)
         m = int((seconds % 3600) // 60)
         s = int(seconds % 60)
