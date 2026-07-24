@@ -28,6 +28,7 @@ import subprocess
 import os
 import time
 import sys
+import re
 
 WHISPER_MODEL_SIZE = "large-v3"
 
@@ -168,7 +169,7 @@ class VideoSummarizerApp:
 
             self.status_text.set("要約生成中...")
             self.log("[3/3] transformers で要約生成開始")
-            summary = self._summarize_with_transformers(full_text)
+            summary = self._summarize(full_text)
             self.log("[3/3] 要約生成完了")
 
             with open(output_path, "w", encoding="utf-8") as f:
@@ -242,7 +243,7 @@ class VideoSummarizerApp:
         self.log(f"   検出言語: {info.language} (確度: {info.language_probability:.2f})")
         return list(segments)
 
-    def _summarize_with_transformers(self, text):
+    def _summarize(self, text):
         # 文字起こし全文から重要文を抽出して要約する
         # 教師なしの TextRank を使用（LLM不要、軽量）
         self.log("   TextRank 抽出型要約を実行中...")
@@ -314,7 +315,6 @@ class VideoSummarizerApp:
     @staticmethod
     def _split_sentences(text):
         # 日本語の句点（。！？）と改行で文単位に分割
-        import re
         raw = re.split(r"(?<=[。！？\n])", text)
         result = []
         for s in raw:
