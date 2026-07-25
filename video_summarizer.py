@@ -29,6 +29,7 @@ import os
 import time
 import sys
 import re
+from faster_whisper import WhisperModel
 
 WHISPER_MODEL_SIZE = "large-v3"
 

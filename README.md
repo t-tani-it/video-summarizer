@@ -22,10 +22,30 @@ WAV (16kHz モノラル)
 
 ## インストール
 
+### 共通: ffmpeg
+
+```bash
+winget install ffmpeg    # Windows
+# または https://ffmpeg.org からダウンロードして PATH を通す
+```
+
+### Python パッケージ
+
+以下のいずれかの方法でインストールしてください。
+
+**方法A: pip (シンプル / conda 未使用)**
 ```bash
 pip install faster-whisper janome
-winget install ffmpeg    # Windows
 ```
+
+**方法B: conda (ストレージ節約 / 環境分離)**
+```bash
+conda activate base
+pip install faster-whisper janome
+```
+> conda は `pkgs/` ディレクトリのハードリンクにより、複数環境間で同じパッケージを共有します。  
+> インストール済みのパッケージは再ダウンロードされないため、ストレージを節約できます。  
+> conda が未インストールの場合は方法Aで問題なく動作します。
 
 ## 使い方
 
