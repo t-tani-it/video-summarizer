@@ -29,10 +29,11 @@ import os
 import time
 import sys
 import re
-from faster_whisper import WhisperModel
+import json
+import ctypes
 
-WHISPER_MODEL_SIZE = "large-v3"
-
+WHISPER_MODEL_SIZE = "medium"
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 
 def _find_ffmpeg():
     # ffmpegがコマンドとして使えるか確認する
@@ -60,6 +61,47 @@ class VideoSummarizerApp:
         self.is_running = False
 
         self._build_ui()
+        self.root.after(100, self._check_environment)
+
+    def _check_environment(self):
+        cuda12 = cuda11 = False
+        try:
+            ctypes.CDLL("cublas64_12.dll")
+            cuda12 = True
+        except OSError:
+            try:
+                ctypes.CDLL("cublas64_11.dll")
+                cuda11 = True
+            except OSError:
+                pass
+
+        try:
+            import ctranslate2
+            ct_major = int(ctranslate2.__version__.split(".")[0])
+            ct_is_cuda12 = ct_major >= 4
+        except ImportError:
+            ct_is_cuda12 = False
+
+        msg = None
+        if ct_is_cuda12 and not cuda12 and cuda11:
+            msg = ("CUDA 12 用 ctranslate2 がインストールされていますが、\n"
+                   "この環境では CUDA 11 が利用可能です。\n\n"
+                   "setup.ps1 を実行すると最適な構成に変更できます:\n"
+                   "  cd transrateText\n  .\\setup.ps1")
+        elif not ct_is_cuda12 and cuda12:
+            msg = ("CUDA 12 が利用可能ですが、CUDA 11 用 ctranslate2 が\n"
+                   "インストールされています。\n\n"
+                   "setup.ps1 を実行すると最適な構成に変更できます:\n"
+                   "  cd transrateText\n  .\\setup.ps1")
+        elif ct_is_cuda12 and not cuda12 and not cuda11:
+            msg = ("GPU/CUDA が検出されませんでしたが、CUDA 用 ctranslate2 が\n"
+                   "インストールされています。\n\n"
+                   "setup.ps1 を実行すると最適な構成に変更できます:\n"
+                   "  cd transrateText\n  .\\setup.ps1")
+
+        if msg:
+            self.log("環境構成に非最適化があります。setup.ps1 の実行を推奨します。")
+            messagebox.showwarning("環境設定の推奨", msg)
 
     def _build_ui(self):
         main_frame = tk.Frame(self.root, padx=12, pady=12)
@@ -144,32 +186,124 @@ class VideoSummarizerApp:
 
         threading.Thread(target=self._run_pipeline, daemon=True).start()
 
+    def _start_progress_monitor(self):
+        self._progress_count = 0
+        self._progress_active = True
+        self._schedule_progress()
+
+    def _schedule_progress(self):
+        if not self._progress_active:
+            return
+        self._progress_count += 1
+        self.log(f"   文字起こし処理中...（{self._progress_count * 3}分経過）")
+        self.root.after(180000, self._schedule_progress)
+
+    def _stop_progress_monitor(self):
+        self._progress_active = False
+
+    def _get_duration(self, video_path):
+        ffprobe = FFMPEG_PATH.replace("ffmpeg", "ffprobe")
+        cmd = [ffprobe, "-v", "error", "-show_entries",
+               "format=duration", "-of",
+               "default=noprint_wrappers=1:nokey=1", video_path]
+        proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        if proc.returncode != 0:
+            raise RuntimeError(f"動画の長さを取得できませんでした: {proc.stderr.strip()}")
+        duration = proc.stdout.strip()
+        if not duration:
+            raise RuntimeError("動画の長さを取得できませんでした（空の応答）")
+        return int(float(duration))
+
+    def _split_audio_to_chunks(self, video_path, base_path, chunk_sec=720):
+        duration = self._get_duration(video_path)
+        chunks = []
+        for i, start in enumerate(range(0, duration, chunk_sec)):
+            wav = f"{base_path}_chunk{i:03d}.wav"
+            cmd = [
+                FFMPEG_PATH, "-y", "-ss", str(start),
+                "-t", str(min(chunk_sec, duration - start)),
+                "-i", video_path,
+                "-vn", "-acodec", "pcm_s16le",
+                "-ar", "16000", "-ac", "1",
+                wav
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            if proc.returncode != 0:
+                raise RuntimeError(f"ffmpeg chunk error: {proc.stderr.strip()}")
+            chunks.append((start, wav))
+            self.log(f"   チャンク {i + 1}: {start // 60}分〜{min(start + chunk_sec, duration) // 60}分")
+        return chunks
+
+    def _probe_model_size(self):
+        worker = os.path.join(os.path.dirname(__file__), "_transcribe_worker.py")
+        model_dir = os.path.join(os.path.dirname(__file__), "models")
+
+        for size in ["large-v3", "medium"]:
+            self.log(f"   モデル {size} の利用可否を確認中...")
+            probe = subprocess.run(
+                [sys.executable, "-c", f"""
+import sys, os
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+sys.path.insert(0, {os.path.dirname(__file__)!r})
+from faster_whisper import WhisperModel
+try:
+    model = WhisperModel({size!r}, device="cuda", compute_type="int8",
+                         download_root={model_dir!r})
+    del model
+    print("OK")
+except Exception as e:
+    print(f"FAIL: {{e}}")
+"""],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            if "OK" in probe.stdout:
+                self.log(f"   モデル選定: {size} を使用します")
+                return size
+            self.log(f"   {size} は利用不可 → 次サイズにフォールバック")
+        self.log("   モデル選定: medium (最終手段)")
+        return "medium"
+
     def _run_pipeline(self):
-        # 3ステップ(音声抽出→文字起こし→要約)のパイプライン本体
-        # 一時WAVファイルは finally で確実に削除
         video = self.video_path.get()
         base = os.path.splitext(video)[0]
-        wav_path = base + "_audio_temp.wav"
         output_path = base + "_summary.txt"
+        temp_wavs = []
 
         try:
-            self.status_text.set("音声抽出中...")
-            self.log("[1/3] ffmpeg で音声抽出開始")
-            self._extract_audio(video, wav_path)
-            self.log("[1/3] 音声抽出完了")
+            self.status_text.set("モデル選定中...")
+            self.log("[0/3] 最適なモデルサイズを選定中...")
+            model_size = self._probe_model_size()
+            self.status_text.set("音声分割中...")
+            self.log(f"[1/3] ffmpeg で音声分割開始（モデル: {model_size}）")
+            chunks = self._split_audio_to_chunks(video, base, chunk_sec=120)
+            temp_wavs = [w for _, w in chunks]
+            self.log(f"   {len(chunks)} チャンクに分割完了")
 
             self.status_text.set("文字起こし中...")
-            self.log("[2/3] faster-whisper で文字起こし開始")
-            segments = self._transcribe(wav_path)
+            self.log("[2/3] faster-whisper で文字起こし開始（beam_size=1, vad_filter=True）")
+            self._start_progress_monitor()
+            seg_results = []
+            for i, (chunk_start, wav_path) in enumerate(chunks):
+                self.log(f"   チャンク {i + 1}/{len(chunks)} ({chunk_start // 60}分〜) 処理中...")
+                seg_dicts = self._transcribe_chunk(wav_path, model_size)
+                for d in seg_dicts:
+                    seg_results.append({
+                        "start": d["start"] + chunk_start,
+                        "end": d["end"] + chunk_start,
+                        "text": d["text"]
+                    })
+            self._stop_progress_monitor()
             self.log("[2/3] 文字起こし完了")
 
             full_text = "\n".join(
-                f"[{self._fmt_sec(s.start)} -> {self._fmt_sec(s.end)}] {s.text.strip()}"
-                for s in segments
+                f"[{self._fmt_sec(s['start'])} -> {self._fmt_sec(s['end'])}] {s['text']}"
+                for s in seg_results
             )
 
             self.status_text.set("要約生成中...")
-            self.log("[3/3] transformers で要約生成開始")
+            self.log("[3/3] TextRank で要約生成開始")
             summary = self._summarize(full_text)
             self.log("[3/3] 要約生成完了")
 
@@ -196,53 +330,31 @@ class VideoSummarizerApp:
             messagebox.showerror("エラー", str(e))
 
         finally:
-            if os.path.exists(wav_path):
-                try:
-                    os.remove(wav_path)
-                except Exception:
-                    pass
+            for w in temp_wavs:
+                if os.path.exists(w):
+                    try:
+                        os.remove(w)
+                    except Exception:
+                        pass
             self.is_running = False
             self.set_ui_enabled(True)
 
-    def _extract_audio(self, video_path, wav_path):
-        # ffmpegで動画から音声を抽出
-        # 16kHz モノラル WAV はWhisper推奨の入力フォーマット
-        cmd = [
-            FFMPEG_PATH, "-y", "-i", video_path,
-            "-vn", "-acodec", "pcm_s16le",
-            "-ar", "16000", "-ac", "1",
-            wav_path
-        ]
+    def _transcribe_chunk(self, wav_path, model_size):
+        worker = os.path.join(os.path.dirname(__file__), "_transcribe_worker.py")
+        model_dir = os.path.join(os.path.dirname(__file__), "models")
         proc = subprocess.run(
-            cmd, capture_output=True, text=True,
+            [sys.executable, worker, wav_path, model_size, model_dir],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             creationflags=subprocess.CREATE_NO_WINDOW
         )
+        for line in proc.stderr.strip().split("\n"):
+            if line.strip():
+                self.log(f"     {line.strip()}")
         if proc.returncode != 0:
-            raise RuntimeError(f"ffmpeg error: {proc.stderr.strip()}")
+            raise RuntimeError(f"文字起こしワーカーが失敗しました: {proc.stderr.strip()}")
+        return json.loads(proc.stdout)
 
-    def _transcribe(self, audio_path):
-        # faster-whisper で音声認識
-        # CUDA有無を自動判定しGPU/CPUを切り替え
-        # large-v3モデル（日本語に最適）は初回起動時に自動ダウンロード(~3GB)
-        try:
-            import ctranslate2
-            has_cuda = ctranslate2.get_cuda_device_count() > 0
-        except Exception:
-            has_cuda = False
-
-        device = "cuda" if has_cuda else "cpu"
-        compute = "int8_float16" if has_cuda else "int8"
-        self.log(f"   認識デバイス: {'GPU (CUDA)' if has_cuda else 'CPU'}")
-
-        model = WhisperModel(
-            WHISPER_MODEL_SIZE,
-            device=device,
-            compute_type=compute,
-            download_root=os.path.join(os.path.dirname(__file__), "models")
-        )
-        segments, info = model.transcribe(audio_path, language="ja", beam_size=3)
-        self.log(f"   検出言語: {info.language} (確度: {info.language_probability:.2f})")
-        return list(segments)
 
     def _summarize(self, text):
         # 文字起こし全文から重要文を抽出して要約する
