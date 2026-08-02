@@ -11,7 +11,7 @@ flowchart TD
     B --> C[WAV<br/>16kHz モノラル]
     C --> D[faster-whisper<br/>文字起こし]
     D --> E[文字起こし全文<br/>タイムスタンプ付き]
-    E --> F[TextRank (janome)<br/>抽出型要約]
+    E -->     F["TextRank (janome)<br/>抽出型要約"]
     F --> G[出力: *_summary.txt]
 ```
 
